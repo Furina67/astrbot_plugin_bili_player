@@ -268,7 +268,12 @@ class _LlmSearch:
 
 
 class _SelectionSessionFilter(SessionFilter):
-    """Route only an active result-selection reply into AstrBot's waiter."""
+    """Route only an active result-selection reply into AstrBot's waiter.
+
+    Only a syntactically valid selection reply may wake the waiter. Every other
+    message in the chat must keep flowing through the normal pipeline, otherwise
+    unrelated chatter would re-enter the handler and emit the help text forever.
+    """
 
     def __init__(self, session_id: str) -> None:
         self._session_id = session_id
@@ -287,17 +292,20 @@ class _SelectionSessionFilter(SessionFilter):
 
 
 class _DiscardSelectionWaitFilter(CustomFilter):
-    """Activate only for a new message that supersedes an active selection."""
+    """Fire only when the user explicitly abandons a pending selection.
+
+    A ``custom_filter`` decides whether its handler runs at all, so returning
+    ``True`` for ordinary chatter would make every message cancel the pending
+    wait -- and a waiter that keeps answering with the help text while never
+    receiving the real reply is exactly the endless-prompt bug. Only ``取消``
+    (and a new explicit search, handled elsewhere) may end the wait here.
+    """
 
     def filter(self, event: AstrMessageEvent, _config: Any) -> bool:
         message = " ".join(event.message_str.split())
         if _is_selection_reply(message):
             return False
-        return any(
-            isinstance(session_filter, _SelectionSessionFilter)
-            and session_filter.session_id == event.unified_msg_origin
-            for session_filter in tuple(FILTERS)
-        )
+        return message == "取消"
 
 
 def _bilibili_request_parameters() -> dict[str, Any]:
@@ -992,12 +1000,18 @@ class ListenMusicPlugin(Star):
             source_event.stop_event()
             self._finish_selection_wait(snapshot.session_id, selection)
 
-    def _renew_selection_wait(self, controller: SessionController) -> None:
-        """Extend an active selection waiter after a non-terminal reply.
+    def _renew_selection_wait(
+        self,
+        controller: SessionController,
+        *,
+        reset_timeout: bool = False,
+    ) -> None:
+        """Keep an active selection waiter alive after a non-terminal reply.
 
-        The waiter is registered with a fixed timeout, so a reply that keeps the
-        flow open must also push the deadline out; otherwise the catalogue expires
-        mid-conversation. ``keep`` resets the timer without stopping the wait.
+        ``keep`` only extends the deadline of the current wait; it never stops it
+        and never re-delivers an event. ``reset_timeout=False`` adds the extra
+        window on top of whatever time is left, so a chatty session still expires
+        instead of living forever.
         """
         keep = getattr(controller, "keep", None)
         if keep is None:
@@ -1006,7 +1020,7 @@ class ListenMusicPlugin(Star):
             # AstrBot's SessionController.keep() has changed keyword names across
             # releases, so call it defensively and fall back to the documented form.
             try:
-                keep(timeout=INTERACTION_TIMEOUT_SECONDS, reset_timeout=True)
+                keep(timeout=INTERACTION_TIMEOUT_SECONDS, reset_timeout=reset_timeout)
             except TypeError:
                 keep()
         except asyncio.CancelledError:
@@ -1023,7 +1037,7 @@ class ListenMusicPlugin(Star):
     ) -> None:
         """Resolve the next real user reply against its original snapshot."""
 
-        stop_wait = True
+        keep_open = False  # only the duration hint leaves the choice pending
         settings = getattr(self, "_settings", None) or PluginSettings()
         try:
             if " ".join(reply.message_str.split()) == "取消":
@@ -1032,10 +1046,10 @@ class ListenMusicPlugin(Star):
             parsed = _parse_selection_for_settings(reply.message_str, settings)
             if parsed is None:
                 await reply.send(reply.plain_result(_selection_help(settings)))
-                stop_wait = False
-                # Keep the waiter alive across a confused reply; without a
-                # renewal the original 90s deadline still kills the selection.
-                self._renew_selection_wait(controller)
+                # Do NOT renew the wait here. A non-selection message can only
+                # reach this point if some filter wrongly claimed it, and
+                # renewing would turn that mistake into an endless help-text
+                # loop. The deadline simply keeps counting down as documented.
                 return
             position, action = parsed
             if action is _DeliveryMode.VIDEO and not settings.video_allowed:
@@ -1065,8 +1079,10 @@ class ListenMusicPlugin(Star):
                         f"请回复“{position} 音频下载”下载音频文件。"
                     )
                 await reply.send(reply.plain_result(hint))
-                stop_wait = False
-                self._renew_selection_wait(controller)
+                # The user still has a valid choice to make, so stay open -- but
+                # keep the original deadline instead of extending it forever.
+                keep_open = True
+                self._renew_selection_wait(controller, reset_timeout=False)
                 return
             await self._deliver_media(reply, candidate=candidate, action=action)
         except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
@@ -1076,9 +1092,10 @@ class ListenMusicPlugin(Star):
             await reply.send(reply.plain_result("歌曲发送失败，请稍后重试。"))
         finally:
             # Red line: this reply belongs to the selection flow, never to the
-            # LLM. Stopping it here also covers the "keep the flow open" path.
+            # LLM. Every terminal branch must also stop the waiter, otherwise the
+            # filter stays in ``FILTERS`` and later messages re-enter it.
             reply.stop_event()
-            if stop_wait:
+            if not keep_open:
                 controller.stop()
 
     async def _cancel_selection_wait(self, session_id: str) -> None:
