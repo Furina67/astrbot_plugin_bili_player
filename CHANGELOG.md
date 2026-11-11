@@ -1,5 +1,10 @@
 # 更新日志
 
+## 0.2.9 - 2026-11-11
+
+- **紧急修复 `search_song` 崩溃**：0.2.8 的注册轮询误用了未导入的 `USER_SESSIONS`，报 `name is not defined`。
+- 轮询条件改为检查模块级 `FILTERS` 中是否已出现本轮的 `_SelectionSessionFilter` 实例（由 `register_wait` 写入），语义等价且不再依赖 AstrBot 内部全局变量，跨版本更稳。
+
 ## 0.2.8 - 2026-11-11
 
 - **真正根因修复：自定义 `SessionFilter` 从未被注册**。`@session_waiter` 未传入 `session_filter`，装饰器于是回退到内置 `DefaultSessionFilter`，插件里写好的 `_SelectionSessionFilter`（按会话 ID + 序号语法校验）从头到尾没有被实例化，`_DiscardSelectionWaitFilter` 也就永远找不到目标而沦为死代码。现在把 `selection_filter = _SelectionSessionFilter(session_id)` 显式传入并为 `_run_selection_wait` 增加对应形参，`await waiter(source_event, selection_filter)` 按位置传参（关键字会让装饰器回退到默认 filter）。
