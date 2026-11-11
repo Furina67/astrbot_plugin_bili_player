@@ -1,3 +1,12 @@
+## 0.2.13 - 2026-11-11
+
+### 修复
+- 群聊回复序号后机器人「卡一下」（2~3 秒无响应）：兜底处理器此前会 `await _cancel_selection_wait()`，
+  它停止 waiter 用的是 `SessionController.stop()`，而 AstrBot 的 `FILTERS` 是全局轮询列表，
+  waiter 协程尚未返回时 filter 就被判为失效，导致后续消息在派发阶段被整体中止。
+- 现在兜底路径不再取消 waiter：先 `stop_event()` 并投递媒体，最后再让 waiter 自然结束，
+  既保证消息不被 LLM 抢答，也不会中断消息派发流水线。
+
 # 更新日志
 
 ## 0.2.12 - 2026-11-11
