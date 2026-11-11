@@ -544,7 +544,8 @@ class ListenMusicPlugin(Star):
     @filter.command("/我要看")
     async def watch_command(self, event: AstrMessageEvent, query: GreedyStr):
         """兜底命令：/我要看 <作品名> 直接发第一个视频；含 AV/BV 时先展示分 P。"""
-        event.should_call_llm(True)
+        # 命令事件由插件独占，后续消息交给会话控制，避免被 LLM 当成聊天。
+        event.should_call_llm(False)
         if not self._settings.video_allowed:
             yield event.plain_result(
                 "当前插件配置未开启视频交付。\n可在插件配置中调整“默认媒体类型”。"
@@ -600,6 +601,7 @@ class ListenMusicPlugin(Star):
             yield event.plain_result("视频发送失败，请稍后重试。")
             event.stop_event()
             return
+        event.should_call_llm(False)
         event.stop_event()
 
     async def _run_search_command(
@@ -611,7 +613,11 @@ class ListenMusicPlugin(Star):
     ) -> AsyncIterator[str]:
         """Show the candidate catalogue and own the following selection."""
 
-        event.should_call_llm(True)
+        # Never hand a search command to the LLM: the candidate list plus the
+        # selection waiter are the plugin's own turn. Previously this called
+        # should_call_llm(True), so a following bare "3" reached the model as
+        # ordinary chat text instead of the selection grammar.
+        event.should_call_llm(False)
         query = query.strip()
         if not query:
             yield event.plain_result(f"请使用：{usage}")
@@ -643,6 +649,9 @@ class ListenMusicPlugin(Star):
             event.stop_event()
             return
         yield event.plain_result(self._format_selection_results(snapshot))
+        # The catalogue is the plugin's whole turn: keep it away from the LLM
+        # so the following selection reply is routed by the waiter, not chat.
+        event.should_call_llm(False)
         event.stop_event()
 
     async def find_in_bilibili_for_llm(
@@ -892,6 +901,13 @@ class ListenMusicPlugin(Star):
         # Ensure SessionWaiter has registered before the result list can reach
         # a user able to reply immediately.
         await asyncio.sleep(0)
+
+        # The search turn belongs to the plugin until the user answers it. The
+        # manual SessionWaiter wiring above bypasses the automatic ownership
+        # that @session_waiter would set up, so refuse the LLM hand-off here.
+        # Without this the source event could still reach the model and a bare
+        # "3" would be answered as ordinary chat instead of a selection.
+        event.should_call_llm(False)
         return True
 
     async def _run_selection_wait(
@@ -930,6 +946,29 @@ class ListenMusicPlugin(Star):
                 pass
             self._finish_selection_wait(snapshot.session_id, selection)
 
+def _renew_selection_wait(controller: SessionController) -> None:
+    """Extend an active selection waiter after a non-terminal reply.
+
+    The waiter is registered with a fixed timeout, so a reply that keeps the
+    flow open must also push the deadline out; otherwise the catalogue expires
+    mid-conversation. ``keep`` resets the timer without stopping the wait.
+    """
+    keep = getattr(controller, "keep", None)
+    if keep is None:
+        return
+    try:
+        # AstrBot's SessionController.keep() has changed keyword names across
+        # releases, so call it defensively and fall back to the documented form.
+        try:
+            keep(timeout=INTERACTION_TIMEOUT_SECONDS, reset_timeout=True)
+        except TypeError:
+            keep()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("bili-player selection keep failed", exc_info=True)
+
+
     async def _deliver_selection(
         self,
         controller: SessionController,
@@ -948,6 +987,9 @@ class ListenMusicPlugin(Star):
             if parsed is None:
                 await reply.send(reply.plain_result(_selection_help(settings)))
                 stop_wait = False
+                # Keep the waiter alive across a confused reply; without a
+                # renewal the original 90s deadline still kills the selection.
+                _renew_selection_wait(controller)
                 return
             position, action = parsed
             if action is _DeliveryMode.VIDEO and not settings.video_allowed:
@@ -978,6 +1020,7 @@ class ListenMusicPlugin(Star):
                     )
                 await reply.send(reply.plain_result(hint))
                 stop_wait = False
+                _renew_selection_wait(controller)
                 return
             await self._deliver_media(reply, candidate=candidate, action=action)
         except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
