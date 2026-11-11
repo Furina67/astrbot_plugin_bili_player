@@ -72,7 +72,9 @@ from .core.services import (
 
 
 PLUGIN_NAME = "astrbot_plugin_bili_player"
-INTERACTION_TIMEOUT_SECONDS = 90
+# A catalogue is easy to skim past; 90s expired while the user was still
+# reading, and every late reply was then answered by the LLM instead.
+INTERACTION_TIMEOUT_SECONDS = 300
 SEARCH_SNAPSHOT_TTL_SECONDS = 300.0
 SEARCH_SNAPSHOT_MAX_ENTRIES = 1024
 # AstrBot's weixin_oc adapter accepts File outbound but ignores Record.
@@ -102,14 +104,23 @@ _SELECTION_POSITION_PATTERN = "|".join(
         (re.escape(value) for value in _SELECTION_POSITION_MAP), key=len, reverse=True
     )
 )
+# Users often paste a position back with the punctuation the catalogue used,
+# so the grammar tolerates wrapping quotes/brackets around the whole reply.
+# Without this a perfectly valid quote-wrapped position would slip past the
+# waiter and be answered by the LLM instead of being delivered.
+_SELECTION_EDGE_CHARS = (
+    " \t\u3000" + "\"'" + "\u201c\u201d\u2018\u2019\u300a\u300b\u3010\u3011()\uff08\uff09"
+)
 _SELECTION_RE = re.compile(
-    r"^(?:(?:我|我要|我想|帮我|请)\s*)?"
+    rf"^[{_SELECTION_EDGE_CHARS}]*"
+    r"(?:(?:我|我要|我想|帮我|请)\s*)?"
     r"(?:(音频下载|下载|听(?:歌)?|播放|视频|音频)\s*)?"
     r"(?:(?:选择|选)\s*)?"
     rf"(?:第\s*)?({_SELECTION_POSITION_PATTERN})\s*(?:首(?:歌)?|个|号)?"
     r"(?:\s*(音频下载|下载|听(?:歌)?|播放|视频|音频))?"
-    r"(?:[，,。！？!]\s*)*$"
+    rf"(?:[\uff0c,\u3002\uff01\uff1f!{_SELECTION_EDGE_CHARS}])*$"
 )
+
 
 
 class _DeliveryMode(str, Enum):
