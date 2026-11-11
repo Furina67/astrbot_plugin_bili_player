@@ -1,5 +1,12 @@
 # 更新日志
 
+## 0.2.8 - 2026-11-11
+
+- **真正根因修复：自定义 `SessionFilter` 从未被注册**。`@session_waiter` 未传入 `session_filter`，装饰器于是回退到内置 `DefaultSessionFilter`，插件里写好的 `_SelectionSessionFilter`（按会话 ID + 序号语法校验）从头到尾没有被实例化，`_DiscardSelectionWaitFilter` 也就永远找不到目标而沦为死代码。现在把 `selection_filter = _SelectionSessionFilter(session_id)` 显式传入并为 `_run_selection_wait` 增加对应形参，`await waiter(source_event, selection_filter)` 按位置传参（关键字会让装饰器回退到默认 filter）。
+- `_NullSelectionController.stop()` 由空操作改为真实实现（置 `stopped` 标志），使 `_cancel_selection_wait()` 能真正取消旧 waiter，避免新旧 waiter 互相覆盖、旧 `_cleanup()` 误清新 waiter。
+- 候选列表发出前的 `await asyncio.sleep(0)` 改为最多 0.5 秒的注册轮询（50 × 10ms）：确认 `USER_SESSIONS` 已写入或 waiter 已结束后再返回，消除“注册尚未完成就发列表”的竞态。
+- `metadata.yaml` 的 `repo` 指向更新为 `Furina67/astrbot_plugin_bili_player`，与插件市场实际发布仓库一致。
+
 ## 0.2.7 - 2026-11-11
 
 - **彻底修复：搜索歌曲后回复裸序号（如「2」）被 LLM 抢答**。上一版只对命令事件调用 `should_call_llm(False)`，但「2」是一条独立的新消息，不受影响；本次改用 AstrBot 官方的会话控制机制接管选择轮次。
