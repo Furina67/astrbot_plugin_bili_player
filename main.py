@@ -946,27 +946,27 @@ class ListenMusicPlugin(Star):
                 pass
             self._finish_selection_wait(snapshot.session_id, selection)
 
-def _renew_selection_wait(controller: SessionController) -> None:
-    """Extend an active selection waiter after a non-terminal reply.
+    def _renew_selection_wait(self, controller: SessionController) -> None:
+        """Extend an active selection waiter after a non-terminal reply.
 
-    The waiter is registered with a fixed timeout, so a reply that keeps the
-    flow open must also push the deadline out; otherwise the catalogue expires
-    mid-conversation. ``keep`` resets the timer without stopping the wait.
-    """
-    keep = getattr(controller, "keep", None)
-    if keep is None:
-        return
-    try:
-        # AstrBot's SessionController.keep() has changed keyword names across
-        # releases, so call it defensively and fall back to the documented form.
+        The waiter is registered with a fixed timeout, so a reply that keeps the
+        flow open must also push the deadline out; otherwise the catalogue expires
+        mid-conversation. ``keep`` resets the timer without stopping the wait.
+        """
+        keep = getattr(controller, "keep", None)
+        if keep is None:
+            return
         try:
-            keep(timeout=INTERACTION_TIMEOUT_SECONDS, reset_timeout=True)
-        except TypeError:
-            keep()
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.debug("bili-player selection keep failed", exc_info=True)
+            # AstrBot's SessionController.keep() has changed keyword names across
+            # releases, so call it defensively and fall back to the documented form.
+            try:
+                keep(timeout=INTERACTION_TIMEOUT_SECONDS, reset_timeout=True)
+            except TypeError:
+                keep()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("bili-player selection keep failed", exc_info=True)
 
 
     async def _deliver_selection(
@@ -989,7 +989,7 @@ def _renew_selection_wait(controller: SessionController) -> None:
                 stop_wait = False
                 # Keep the waiter alive across a confused reply; without a
                 # renewal the original 90s deadline still kills the selection.
-                _renew_selection_wait(controller)
+                self._renew_selection_wait(controller)
                 return
             position, action = parsed
             if action is _DeliveryMode.VIDEO and not settings.video_allowed:
@@ -1020,7 +1020,7 @@ def _renew_selection_wait(controller: SessionController) -> None:
                     )
                 await reply.send(reply.plain_result(hint))
                 stop_wait = False
-                _renew_selection_wait(controller)
+                self._renew_selection_wait(controller)
                 return
             await self._deliver_media(reply, candidate=candidate, action=action)
         except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
