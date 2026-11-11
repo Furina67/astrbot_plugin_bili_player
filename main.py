@@ -248,6 +248,8 @@ class _SelectionWait:
     finished: asyncio.Event
     task: asyncio.Task[None] | None = None
     cancelled: bool = False
+    # Kept so the no-waiter fallback can still resolve a position into media.
+    snapshot: SearchSnapshot | None = None
 
 
 class _NullSelectionController:
@@ -460,6 +462,9 @@ class ListenMusicPlugin(Star):
         self._search: SearchService | None = None
         self._delivery: DeliveryService | None = None
         self._selection_waits: dict[str, _SelectionWait] = {}
+        # Newest catalogue per chat, kept independently of the waiter so a late
+        # reply can still be resolved by ``fallback_selection_reply``.
+        self._recent_selections: dict[str, tuple[float, SearchSnapshot]] = {}
         self._llm_searches: dict[str, _LlmSearch] = {}
         self._selection_lock = asyncio.Lock()
         self._initialized = False
@@ -525,6 +530,7 @@ class ListenMusicPlugin(Star):
         async with self._selection_lock:
             selection_waits = tuple(self._selection_waits.values())
             self._selection_waits.clear()
+            self._recent_selections.clear()
             self._llm_searches.clear()
         for selection in selection_waits:
             selection.cancelled = True
@@ -862,6 +868,87 @@ class ListenMusicPlugin(Star):
             logger.exception("bili-player LLM candidate delivery failed")
             return _tool_error("歌曲发送失败，请稍后重试。")
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=12)
+    async def fallback_selection_reply(self, event: AstrMessageEvent) -> None:
+        """Guarantee a bare selection reply is handled even without a waiter.
+
+        ``@session_waiter`` registration depends on AstrBot internals: if the
+        waiter is not armed (late registration, a failed ``FILTERS.append``, or
+        a restart between the catalogue and the reply) the bare ``2`` fell
+        through to the LLM and the model answered the number as chat. This
+        handler re-checks the *plugin's own* snapshot store, so a valid position
+        is delivered regardless of the waiter's state.
+        """
+
+        if not self._initialized:
+            return
+        message = " ".join(event.message_str.split())
+        if not _is_selection_reply(message):
+            return
+        session_id = event.unified_msg_origin
+        settings = getattr(self, "_settings", None) or PluginSettings()
+        parsed = _parse_selection_for_settings(message, settings)
+        if parsed is None:
+            return
+        position, _action = parsed
+
+        # Only claim the message when this chat truly owns a live snapshot;
+        # otherwise an arbitrary ``3`` in normal chat would be hijacked.
+        entry = self._recent_selections.get(session_id)
+        if entry is None:
+            return
+        if entry[0] <= time.monotonic():
+            self._recent_selections.pop(session_id, None)
+            return
+        current = entry[1]
+        try:
+            current = self._require_search().snapshot(
+                search_id=current.search_id,
+                session_id=session_id,
+            )
+        except Exception:
+            return
+        if current is None or current.candidate_at(position) is None:
+            return
+
+        logger.info(
+            "bili-player fallback claimed selection reply (session=%s, text=%r)",
+            session_id,
+            message,
+        )
+        await self._cancel_selection_wait(session_id)
+        event.should_call_llm(False)
+        await self._deliver_selection_for_fallback(event, current, position, _action)
+        event.stop_event()
+
+    async def _deliver_selection_for_fallback(
+        self,
+        event: AstrMessageEvent,
+        snapshot: SearchSnapshot,
+        position: int,
+        action: _DeliveryMode,
+    ) -> None:
+        """Deliver one resolved candidate without an active session waiter."""
+
+        settings = getattr(self, "_settings", None) or PluginSettings()
+        candidate = snapshot.candidate_at(position)
+        if candidate is None:
+            await event.send(event.plain_result("搜索结果已过期，请重新搜索。"))
+            return
+        if action is _DeliveryMode.VIDEO and not settings.video_allowed:
+            await event.send(event.plain_result("当前插件配置未开启视频交付。"))
+            return
+        if action is not _DeliveryMode.VIDEO and not settings.audio_allowed:
+            await event.send(event.plain_result("当前插件配置未开启音频交付。"))
+            return
+        try:
+            await self._deliver_media(event, candidate=candidate, action=action)
+        except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
+            await event.send(event.plain_result(str(exc)))
+        except Exception:
+            logger.exception("bili-player fallback delivery failed")
+            await event.send(event.plain_result("歌曲发送失败，请稍后重试。"))
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=11)
     async def discard_llm_search_on_new_message(self, event: AstrMessageEvent) -> None:
         """A new chat message must not revive a prior hidden model selection."""
@@ -935,9 +1022,18 @@ class ListenMusicPlugin(Star):
         await self._cancel_selection_wait(session_id)
         finished = asyncio.Event()
         selection = _SelectionWait(
-            controller=_NullSelectionController(), finished=finished
+            controller=_NullSelectionController(),
+            finished=finished,
+            snapshot=snapshot,
         )
         self._selection_waits[session_id] = selection
+        # Remember the catalogue independently of the waiter's lifetime: a
+        # reply arriving after the wait expired must still resolve to media
+        # instead of being answered by the LLM as plain chat.
+        self._recent_selections[session_id] = (
+            time.monotonic() + SEARCH_SNAPSHOT_TTL_SECONDS,
+            snapshot,
+        )
 
         @session_waiter(
             timeout=INTERACTION_TIMEOUT_SECONDS,
@@ -946,6 +1042,11 @@ class ListenMusicPlugin(Star):
         async def select_song(
             controller: SessionController, reply: AstrMessageEvent
         ) -> None:
+            logger.info(
+                "bili-player selection handler fired (session=%s, text=%r)",
+                snapshot.session_id,
+                reply.message_str,
+            )
             await self._deliver_selection(controller, reply, snapshot)
 
         # AstrBot resolves the waiter key from the filter passed at call time.
@@ -956,25 +1057,45 @@ class ListenMusicPlugin(Star):
 
         # Register the waiter *now*, not from a fire-and-forget task: a reply
         # arriving right after the catalogue must already be intercepted.
-        selection.task = asyncio.ensure_future(
+        selection.task = asyncio.create_task(
             self._run_selection_wait(
                 source_event=event,
                 snapshot=snapshot,
                 waiter=select_song,
                 selection=selection,
                 selection_filter=selection_filter,
-            )
+            ),
+            name=f"bili-player-selection-{session_id}",
         )
-        # Wait until the waiter has actually appended our filter to the module
-        # level ``FILTERS`` list (that happens inside ``register_wait``). A bare
-        # ``sleep(0)`` yields only once and can return before registration, so
-        # the very first selection reply would still reach the LLM. Polling the
-        # filter list avoids reaching into AstrBot internals such as
-        # ``USER_SESSIONS``, and stays correct across releases.
-        for _ in range(50):
-            if selection.task.done() or selection_filter in tuple(FILTERS):
+
+        # ``register_wait`` runs inside the waiter coroutine and only then does
+        # ``FILTERS.append`` happen. Giving the freshly created task a chance to
+        # run once (``sleep(0)``) is not enough -- the coroutine has to enter
+        # ``await future``, which costs another scheduling round trip. Poll the
+        # filter list for up to two seconds so the very first selection reply is
+        # always intercepted instead of leaking to the LLM.
+        registered = False
+        for _ in range(200):
+            if selection_filter in tuple(FILTERS):
+                registered = True
+                break
+            if selection.task.done():
+                # The waiter already finished (or crashed) before registering.
                 break
             await asyncio.sleep(0.01)
+        if not registered:
+            logger.warning(
+                "bili-player selection waiter did not register in time "
+                "(task done=%s, session=%s)",
+                selection.task.done(),
+                session_id,
+            )
+        else:
+            logger.info(
+                "bili-player selection waiter armed (session=%s, filters=%d)",
+                session_id,
+                len(tuple(FILTERS)),
+            )
         return True
 
     async def _run_selection_wait(
@@ -992,7 +1113,15 @@ class ListenMusicPlugin(Star):
             # The filter must be passed positionally: the decorator resolves the
             # session key from it and registers it in ``FILTERS`` for the wake
             # check. Omitting it falls back to the catch-all default filter.
+            logger.info(
+                "bili-player entering selection waiter (session=%s)",
+                snapshot.session_id,
+            )
             await waiter(source_event, selection_filter)
+            logger.info(
+                "bili-player selection waiter returned normally (session=%s)",
+                snapshot.session_id,
+            )
         except TimeoutError:
             if not selection.cancelled and self._initialized:
                 await source_event.send(
