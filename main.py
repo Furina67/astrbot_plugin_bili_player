@@ -946,16 +946,16 @@ class ListenMusicPlugin(Star):
                 selection_filter=selection_filter,
             )
         )
-        # Wait until the waiter is actually inside ``register_wait``. The
-        # decorated wrapper does a few statements of work before it populates
-        # ``USER_SESSIONS``; a bare ``sleep(0)`` yields just once and can return
-        # before registration finishes, letting the very first selection reply
-        # reach the LLM. Poll briefly instead of guessing a fixed delay.
+        # Wait until the waiter has actually appended our filter to the module
+        # level ``FILTERS`` list (that happens inside ``register_wait``). A bare
+        # ``sleep(0)`` yields only once and can return before registration, so
+        # the very first selection reply would still reach the LLM. Polling the
+        # filter list avoids reaching into AstrBot internals such as
+        # ``USER_SESSIONS``, and stays correct across releases.
         for _ in range(50):
-            if not USER_SESSIONS.get(session_id) and not selection.task.done():
-                await asyncio.sleep(0.01)
-                continue
-            break
+            if selection.task.done() or selection_filter in tuple(FILTERS):
+                break
+            await asyncio.sleep(0.01)
         return True
 
     async def _run_selection_wait(
