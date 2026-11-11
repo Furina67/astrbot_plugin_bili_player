@@ -240,13 +240,22 @@ class _SelectionWait:
 
 
 class _NullSelectionController:
-    """Placeholder kept for the ``_SelectionWait`` shape before a waiter runs."""
+    """Placeholder kept for the ``_SelectionWait`` shape before a waiter runs.
+
+    ``stopped`` lets ``_start_selection_wait`` tell a not-yet-registered waiter
+    apart from a real ``SessionController``: the real one is swapped in as soon
+    as the decorated handler fires, and calling ``stop()`` on the placeholder
+    must still cancel the pending selection.
+    """
+
+    def __init__(self) -> None:
+        self.stopped = False
 
     def keep(self, *args: Any, **kwargs: Any) -> None:
         return None
 
     def stop(self) -> None:
-        return None
+        self.stopped = True
 
 
 @dataclass(slots=True)
@@ -920,6 +929,12 @@ class ListenMusicPlugin(Star):
         ) -> None:
             await self._deliver_selection(controller, reply, snapshot)
 
+        # AstrBot resolves the waiter key from the filter passed at call time.
+        # Without an explicit filter the default one matches *every* message in
+        # the chat, so unrelated traffic would be swallowed by the waiter and
+        # ``_DiscardSelectionWaitFilter`` could never recognise it either.
+        selection_filter = _SelectionSessionFilter(session_id)
+
         # Register the waiter *now*, not from a fire-and-forget task: a reply
         # arriving right after the catalogue must already be intercepted.
         selection.task = asyncio.ensure_future(
@@ -928,9 +943,19 @@ class ListenMusicPlugin(Star):
                 snapshot=snapshot,
                 waiter=select_song,
                 selection=selection,
+                selection_filter=selection_filter,
             )
         )
-        await asyncio.sleep(0)
+        # Wait until the waiter is actually inside ``register_wait``. The
+        # decorated wrapper does a few statements of work before it populates
+        # ``USER_SESSIONS``; a bare ``sleep(0)`` yields just once and can return
+        # before registration finishes, letting the very first selection reply
+        # reach the LLM. Poll briefly instead of guessing a fixed delay.
+        for _ in range(50):
+            if not USER_SESSIONS.get(session_id) and not selection.task.done():
+                await asyncio.sleep(0.01)
+                continue
+            break
         return True
 
     async def _run_selection_wait(
@@ -940,11 +965,15 @@ class ListenMusicPlugin(Star):
         snapshot: SearchSnapshot,
         waiter: Any,
         selection: _SelectionWait,
+        selection_filter: SessionFilter,
     ) -> None:
         """Drive the decorated waiter and always release the chat afterwards."""
 
         try:
-            await waiter(source_event)
+            # The filter must be passed positionally: the decorator resolves the
+            # session key from it and registers it in ``FILTERS`` for the wake
+            # check. Omitting it falls back to the catch-all default filter.
+            await waiter(source_event, selection_filter)
         except TimeoutError:
             if not selection.cancelled and self._initialized:
                 await source_event.send(
