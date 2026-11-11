@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.2.10 - 2026-11-11
+
+- **修复“无限重复发送选歌提示”死循环**。`_DiscardSelectionWaitFilter.filter()` 原先对所有非序号消息都返回 `True`（只要有活跃的选歌 filter 就认领）。`custom_filter` 的返回值决定 handler 是否执行，等于把群内所有闲聊都判成选歌回复：消息被交给 waiter → 解析失败 → 发送帮助文本 → 续期 → 超时被无限重置，会话永不结束。现在只有用户显式回复 `取消` 才会触发该 handler。
+- `_deliver_selection` 中解析失败的分支**不再续期**等待（能走到这里只说明有 filter 错误认领，续期会把错误放大成死循环）；时长超限提示分支保留会话但**不重置超时**（`reset_timeout=False`，在剩余时间上叠加）。
+- `_renew_selection_wait` 新增 keyword-only 参数 `reset_timeout`，默认 `False`，与官方文档中 `keep()` “叠加而非重置”的语义一致。
+- `stop_wait` 语义改为 `keep_open`，`finally` 中 `if not keep_open: controller.stop()`，保证每个终止分支都会注销 waiter，避免 filter 残留导致后续消息再次进入 handler。
 ## 0.2.9 - 2026-11-11
 
 - **紧急修复 `search_song` 崩溃**：0.2.8 的注册轮询误用了未导入的 `USER_SESSIONS`，报 `name is not defined`。
