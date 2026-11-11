@@ -1,5 +1,12 @@
 # 更新日志
 
+## 0.2.12 - 2026-11-11
+
+- **修复“回复序号被 LLM 接走”的真正原因**。运行日志显示插件在搜索后**没有任何自己的日志输出**，`3` / `2 音频` 全部落到 LLM，说明等待会话从未成功接管消息。本次做了三件事：
+  1. **兜底 handler `fallback_selection_reply`（priority=12）**：不再单靠 `@session_waiter`。只要本会话仍持有有效搜索快照且回复是合法的序号语法，就由插件直接投递媒体，即使 waiter 没注册成功、已超时或被清理也能接管。
+  2. **独立保存最近一次目录 `_recent_selections`**：与 `_selection_waits` 解耦并带 TTL，避免 waiter 结束（`_finish_selection_wait`）后兜底无快照可用。
+  3. **注册改为 `asyncio.create_task` + 最多 2 秒轮询**（原 0.5 秒），并新增 `selection waiter armed` / `selection handler fired` 日志，`register_wait` 失败会打 WARNING，便于定位。
+- 保留 0.2.11 的 300 秒窗口与引号容忍，0.2.10 的 `取消`-only 与 `keep_open` 语义。
 ## 0.2.11 - 2026-11-11
 
 - **修复“回复序号后不被插件接管、被 LLM 接话”**。两个独立原因：
