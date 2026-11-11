@@ -925,8 +925,13 @@ class ListenMusicPlugin(Star):
         # finish naturally: this handler stops the event, and the waiter's
         # filter no longer matches once the snapshot is gone.
         event.should_call_llm(False)
-        event.stop_event()
+        # Order matters: ``stop_event()`` tells AstrBot this message is fully
+        # handled and flushes the response pipeline. Any ``event.send`` issued
+        # afterwards is buffered and only pushed out when an unrelated message
+        # arrives -- users see the "preparing audio" notice appear minutes later.
+        # So deliver first, stop the event last.
         await self._deliver_selection_for_fallback(event, current, position, _action)
+        event.stop_event()
         await self._cancel_selection_wait(session_id)
 
     async def _deliver_selection_for_fallback(
