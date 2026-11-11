@@ -916,10 +916,18 @@ class ListenMusicPlugin(Star):
             session_id,
             message,
         )
-        await self._cancel_selection_wait(session_id)
+        # The waiter is *not* cancelled here. AstrBot's ``FILTERS`` is a global
+        # polled list that is only cleaned up after the wait coroutine returns,
+        # so cancelling from this handler (registered at priority 12, i.e. ahead
+        # of the waiter's own wake check) can make the pending filter disappear
+        # mid-dispatch and abort the whole message pipeline -- observed as "the
+        # bot just goes silent for a couple of seconds". Let the selection
+        # finish naturally: this handler stops the event, and the waiter's
+        # filter no longer matches once the snapshot is gone.
         event.should_call_llm(False)
-        await self._deliver_selection_for_fallback(event, current, position, _action)
         event.stop_event()
+        await self._deliver_selection_for_fallback(event, current, position, _action)
+        await self._cancel_selection_wait(session_id)
 
     async def _deliver_selection_for_fallback(
         self,
