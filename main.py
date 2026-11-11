@@ -30,6 +30,11 @@ from astrbot.core.utils.session_waiter import (
     SessionWaiter,
 )
 
+try:  # v4.30.0+ moved the decorator to astrbot.api.util
+    from astrbot.api.util import session_waiter  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - older AstrBot releases
+    from astrbot.core.utils.session_waiter import session_waiter  # type: ignore
+
 from .core.accounts import (
     AccountError,
     AccountService,
@@ -232,6 +237,16 @@ class _SelectionWait:
     finished: asyncio.Event
     task: asyncio.Task[None] | None = None
     cancelled: bool = False
+
+
+class _NullSelectionController:
+    """Placeholder kept for the ``_SelectionWait`` shape before a waiter runs."""
+
+    def keep(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
 
 
 @dataclass(slots=True)
@@ -876,38 +891,46 @@ class ListenMusicPlugin(Star):
     async def _start_selection_wait(
         self, event: AstrMessageEvent, snapshot: SearchSnapshot
     ) -> bool:
-        """Register the only selection path for a search result in this chat."""
+        """Own the selection turn with AstrBot's own session waiter.
+
+        The wait is driven by ``@session_waiter`` so the framework itself
+        registers the session before the catalogue is sent, and it also owns
+        the ``event.stop_event()`` call that keeps a bare "2" away from the
+        LLM. The previous hand-rolled ``SessionWaiter`` + ``asyncio.create_task``
+        wiring could register too late, letting the reply reach the model.
+        """
 
         session_id = event.unified_msg_origin
-        selection_filter = _SelectionSessionFilter(session_id)
-        waiter = SessionWaiter(selection_filter, session_id, False)
-        selection = _SelectionWait(waiter.session_controller, asyncio.Event())
-        if not await self._replace_selection_wait(session_id, selection):
+        if not self._initialized:
             return False
 
-        # SessionWaiter registers its session inside register_wait(), while the
-        # global filter list is intentionally owned here so replacement is safe.
-        FILTERS.append(selection_filter)
-        selection.task = asyncio.create_task(
+        await self._cancel_selection_wait(session_id)
+        finished = asyncio.Event()
+        selection = _SelectionWait(
+            controller=_NullSelectionController(), finished=finished
+        )
+        self._selection_waits[session_id] = selection
+
+        @session_waiter(
+            timeout=INTERACTION_TIMEOUT_SECONDS,
+            record_history_chains=False,
+        )
+        async def select_song(
+            controller: SessionController, reply: AstrMessageEvent
+        ) -> None:
+            await self._deliver_selection(controller, reply, snapshot)
+
+        # Register the waiter *now*, not from a fire-and-forget task: a reply
+        # arriving right after the catalogue must already be intercepted.
+        selection.task = asyncio.ensure_future(
             self._run_selection_wait(
                 source_event=event,
                 snapshot=snapshot,
-                selection_filter=selection_filter,
-                waiter=waiter,
+                waiter=select_song,
                 selection=selection,
-            ),
-            name=f"bili-player-selection-{snapshot.search_id}",
+            )
         )
-        # Ensure SessionWaiter has registered before the result list can reach
-        # a user able to reply immediately.
         await asyncio.sleep(0)
-
-        # The search turn belongs to the plugin until the user answers it. The
-        # manual SessionWaiter wiring above bypasses the automatic ownership
-        # that @session_waiter would set up, so refuse the LLM hand-off here.
-        # Without this the source event could still reach the model and a bare
-        # "3" would be answered as ordinary chat instead of a selection.
-        event.should_call_llm(False)
         return True
 
     async def _run_selection_wait(
@@ -915,17 +938,13 @@ class ListenMusicPlugin(Star):
         *,
         source_event: AstrMessageEvent,
         snapshot: SearchSnapshot,
-        selection_filter: _SelectionSessionFilter,
-        waiter: SessionWaiter,
+        waiter: Any,
         selection: _SelectionWait,
     ) -> None:
-        async def select_song(
-            controller: SessionController, reply: AstrMessageEvent
-        ) -> None:
-            await self._deliver_selection(controller, reply, snapshot)
+        """Drive the decorated waiter and always release the chat afterwards."""
 
         try:
-            await waiter.register_wait(select_song, timeout=INTERACTION_TIMEOUT_SECONDS)
+            await waiter(source_event)
         except TimeoutError:
             if not selection.cancelled and self._initialized:
                 await source_event.send(
@@ -940,10 +959,8 @@ class ListenMusicPlugin(Star):
                     source_event.plain_result("选歌流程已结束，请重新搜索。")
                 )
         finally:
-            try:
-                FILTERS.remove(selection_filter)
-            except ValueError:
-                pass
+            # Red line: without this the reply keeps propagating to the LLM.
+            source_event.stop_event()
             self._finish_selection_wait(snapshot.session_id, selection)
 
     def _renew_selection_wait(self, controller: SessionController) -> None:
@@ -1029,6 +1046,9 @@ class ListenMusicPlugin(Star):
             logger.exception("bili-player interactive delivery failed")
             await reply.send(reply.plain_result("歌曲发送失败，请稍后重试。"))
         finally:
+            # Red line: this reply belongs to the selection flow, never to the
+            # LLM. Stopping it here also covers the "keep the flow open" path.
+            reply.stop_event()
             if stop_wait:
                 controller.stop()
 
