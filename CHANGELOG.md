@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.2.7 - 2026-11-11
+
+- **彻底修复：搜索歌曲后回复裸序号（如「2」）被 LLM 抢答**。上一版只对命令事件调用 `should_call_llm(False)`，但「2」是一条独立的新消息，不受影响；本次改用 AstrBot 官方的会话控制机制接管选择轮次。
+- `_start_selection_wait()` 改为用 `@session_waiter(timeout=…, record_history_chains=False)` 装饰内部 `select_song`，并由 `asyncio.ensure_future` 驱动，不再手写 `FILTERS.append` + `asyncio.create_task` + `asyncio.sleep(0)`——旧写法无法保证 waiter 在候选列表发出之前完成注册，导致序号消息到达时无人接管。
+- `_run_selection_wait()` 的 `finally` 新增 `source_event.stop_event()`，`_deliver_selection()` 的 `finally` 新增 `reply.stop_event()`：**消息即使被 waiter 接住，也要显式拦下**，否则事件仍会继续下发到 LLM。
+- 新增 `_NullSelectionController`（`keep()` / `stop()` 均为空操作），用于 waiter 真正运行前 `_SelectionWait.controller` 的合法占位；`_SelectionWait` 语义不变。
+- 导入改为兼容写法：优先 `from astrbot.api.util import session_waiter`（AstrBot v4.30.0+），回退 `astrbot.core.utils.session_waiter`，老版本仍可用。
+
 ## 0.2.6 - 2026-11-11
 
 - **修复命令事件被误交给 LLM**：搜索歌曲 / 搜索视频 / 点听 / 点看 执行后不再调用 should_call_llm(True)，搜索回合由插件独占，候选列表之后的裸序号回复（如 3）改由会话控制路由到选歌流程，不再被模型当成普通聊天。
